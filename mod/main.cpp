@@ -1,6 +1,6 @@
-// libradarilt v1.2 - diagnostic + brute force approach
-// Jika TransformRadarPointToScreenSpace tidak efektif,
-// kita hook DrawRadarMap + DrawBlips langsung dan modif posisi gambar.
+// libradarilt v1.3
+// Derive radar bounds dari titik-titik yang lewat TransformRadarPointToScreenSpace
+// lalu terapkan perspective tilt langsung tanpa butuh m_radarRect.
 
 #include <stdint.h>
 #include <stdio.h>
@@ -9,11 +9,10 @@
 #include <dlfcn.h>
 #include <math.h>
 #include <android/log.h>
-
 #include "mod/amlmod.h"
 
-#define LOG_TAG  "libradarilt"
-#define LOGFILE  "/storage/emulated/0/radarilt_log.txt"
+#define LOG_TAG "libradarilt"
+#define LOGFILE "/storage/emulated/0/radarilt_log.txt"
 
 static void _log(const char* msg) {
     __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, "%s", msg);
@@ -21,151 +20,136 @@ static void _log(const char* msg) {
     if (f) { fputs(msg, f); fputc('\n', f); fclose(f); }
 }
 static void _logf(const char* fmt, ...) {
-    char buf[512];
-    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    char buf[512]; va_list ap;
+    va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
     _log(buf);
 }
 
-// ─── Offsets ─────────────────────────────────────────────────────────────────
-// Semua confirmed dari readelf/nm sesi analisis
-
-#define OFF_TransformRPtoSS   0x0043F5DCu  // void(CVector2D&, const CVector2D&)
-#define OFF_DrawRadarMap      0x0043E5A0u  // void()
-#define OFF_DrawBlips         0x0043E99Cu  // void(float)
-#define OFF_DrawRadarMask     0x00444150u  // void()
-#define OFF_DrawRadarSection  0x004437B0u  // void(int,int,int)
-#define OFF_m_radarRect       0x00994DB0u  // CRect {x1,y1,x2,y2}
-#define OFF_vec2DRadarOrigin  0x00994DA4u  // CVector2D
+// ─── Offsets ──────────────────────────────────────────────────────────────────
+#define OFF_TransformRPtoSS  0x0043F5DCu
+#define OFF_DrawRadarMap     0x0043E5A0u
 
 struct CVector2D { float x, y; };
-struct CRect     { float x1, y1, x2, y2; };
 
-// ─── Global state ─────────────────────────────────────────────────────────────
+// ─── Tilt param ───────────────────────────────────────────────────────────────
+// Perspektif: in.y = -1 (atas radar) sampai +1 (bawah radar)
+// Kita map ke scale Y: atas dikompres, bawah normal.
+// TILT = seberapa besar efek. 0 = flat, 0.5 = cukup kentara.
+#define TILT  0.45f
 
-static uintptr_t g_base      = 0;
-static uint32_t  g_callCount = 0;   // counter: berapa kali hook dipanggil
-static bool      g_logged    = false;
+// ─── Radar bounds autodiscovery ───────────────────────────────────────────────
+// Kita amati in.y == -1.0 (tepi atas) dan in.y == +1.0 (tepi bawah)
+// untuk tahu out.y min/max → dapat center dan half-height layar.
+// Ini akurat karena game selalu menggambar tile dari tepi ke tepi.
 
-// ─── Tilt params ─────────────────────────────────────────────────────────────
-// Pendekatan: modifikasi m_radarRect sebelum DrawRadarMap dipanggil,
-// kembalikan setelah selesai.
-// Ini memaksa game menggambar radar di area yang sudah di-shear.
-//
-// Alternatif: patch vec2DRadarOrigin untuk geser origin.
-//
-// TILT_Y_SHRINK: kompres tinggi radar dari atas (0.0-1.0)
-//   0.7 = atas radar hanya 70% dari posisi normal → terlihat miring
+static float g_screenCY  = 0.0f;
+static float g_screenHH  = 0.0f;
+static bool  g_boundsOK  = false;
 
-#define TILT_Y_SHRINK  0.65f   // semakin kecil = semakin miring
+// Accumulator: kumpulkan min/max out.y selama ~60 call, lalu lock
+static float g_minY      =  1e9f;
+static float g_maxY      = -1e9f;
+static int   g_sampleCnt = 0;
+#define SAMPLE_LOCK 80
 
-// ─── Hook: TransformRadarPointToScreenSpace ───────────────────────────────────
-// Diagnostic: hitung berapa kali dipanggil, log sample pertama
-
+// ─── Hook TransformRadarPointToScreenSpace ────────────────────────────────────
 typedef void (*tTransform)(CVector2D& out, const CVector2D& in);
 static tTransform orig_Transform = nullptr;
 
 static void hk_Transform(CVector2D& out, const CVector2D& in) {
     orig_Transform(out, in);
 
-    g_callCount++;
-
-    // Log 3 sampel pertama untuk verifikasi
-    if (g_callCount <= 3) {
-        _logf("[radarilt] Transform called #%u: in=(%.3f,%.3f) out=(%.3f,%.3f)",
-              g_callCount, in.x, in.y, out.x, out.y);
+    // Phase 1: sampling bounds
+    if (!g_boundsOK) {
+        if (out.y < g_minY) g_minY = out.y;
+        if (out.y > g_maxY) g_maxY = out.y;
+        g_sampleCnt++;
+        if (g_sampleCnt == SAMPLE_LOCK && g_maxY > g_minY) {
+            g_screenCY = (g_minY + g_maxY) * 0.5f;
+            g_screenHH = (g_maxY - g_minY) * 0.5f;
+            g_boundsOK = true;
+            _logf("[radarilt] Bounds locked: minY=%.1f maxY=%.1f cy=%.1f hh=%.1f",
+                  g_minY, g_maxY, g_screenCY, g_screenHH);
+        }
+        return; // jangan modif selama sampling
     }
 
-    // Terapkan tilt: kompres Y dari atas
-    // Baca radar rect untuk dapat center
-    if (!g_base) return;
-    float* r = (float*)(g_base + OFF_m_radarRect);
-    float y1 = r[1], y2 = r[3];
-    if (y2 <= y1) return;
-
-    float radarH  = y2 - y1;
-    float centerY = (y1 + y2) * 0.5f;
-
-    // t = posisi vertikal dalam radar (0=atas, 1=bawah)
-    float t = (out.y - y1) / radarH;
+    // Phase 2: terapkan tilt
+    // in.y range [-1, +1]: -1=atas, +1=bawah
+    // t: 0=atas, 1=bawah
+    float t = (in.y + 1.0f) * 0.5f;
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
 
-    // Scale: atas dikompres, bawah normal
-    float scale = TILT_Y_SHRINK + (1.0f - TILT_Y_SHRINK) * t;
-    float dy    = out.y - centerY;
-    out.y       = centerY + dy * scale;
+    // scale: atas = (1-TILT), bawah = 1.0
+    float scale = (1.0f - TILT) + TILT * t;
+
+    float dy = out.y - g_screenCY;
+    out.y    = g_screenCY + dy * scale;
 }
 
-// ─── Hook: DrawRadarMap (diagnostic) ─────────────────────────────────────────
-
+// ─── Hook DrawRadarMap: reset sampling setiap kali map digambar ───────────────
+// Ini opsional tapi memastikan bounds selalu fresh jika ukuran radar berubah.
 typedef void (*tVoid)(void);
 static tVoid orig_DrawRadarMap = nullptr;
+static int   g_frameCount = 0;
 
 static void hk_DrawRadarMap() {
-    if (!g_logged && g_base) {
-        float* r = (float*)(g_base + OFF_m_radarRect);
-        _logf("[radarilt] DrawRadarMap called! radarRect=(%.1f,%.1f,%.1f,%.1f)",
-              r[0], r[1], r[2], r[3]);
-        CVector2D* origin = (CVector2D*)(g_base + OFF_vec2DRadarOrigin);
-        _logf("[radarilt] vec2DRadarOrigin=(%.3f,%.3f)", origin->x, origin->y);
-        g_logged = true;
+    g_frameCount++;
+    // Re-sample tiap 300 frame (~5 detik) untuk adaptasi ukuran radar
+    if (g_frameCount % 300 == 0) {
+        g_boundsOK  = false;
+        g_sampleCnt = 0;
+        g_minY      =  1e9f;
+        g_maxY      = -1e9f;
     }
     orig_DrawRadarMap();
 }
 
-// ─── AML ─────────────────────────────────────────────────────────────────────
-
-MYMOD(brruham.libradarilt, libradarilt, 1.2, brruham)
+// ─── AML ──────────────────────────────────────────────────────────────────────
+MYMOD(brruham.libradarilt, libradarilt, 1.3, brruham)
 
 ON_MOD_PRELOAD() {
     remove(LOGFILE);
-    _log("[radarilt] === OnModPreLoad v1.2 ===");
+    _log("[radarilt] === OnModPreLoad v1.3 ===");
 }
 
 ON_MOD_LOAD() {
     _log("[radarilt] === OnModLoad mulai ===");
 
-    // Base address
     uintptr_t base = 0;
     {
         FILE* maps = fopen("/proc/self/maps", "r");
-        if (!maps) { _log("[radarilt] ERROR: /proc/self/maps"); return; }
+        if (!maps) { _log("[radarilt] ERROR: maps"); return; }
         char line[512];
         while (fgets(line, sizeof(line), maps)) {
             if (strstr(line, "libGTASA.so") && strstr(line, "r-xp")) {
                 base = (uintptr_t)strtoul(line, nullptr, 16);
-                _logf("[radarilt] base = 0x%08X", (unsigned)base);
                 break;
             }
         }
         fclose(maps);
     }
-    if (!base) { _log("[radarilt] ERROR: base not found"); return; }
-    g_base = base;
+    if (!base) { _log("[radarilt] ERROR: base"); return; }
+    _logf("[radarilt] base = 0x%08X", (unsigned)base);
 
-    // Dobby
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hDobby) { _log("[radarilt] ERROR: libdobby"); return; }
+    if (!hDobby) { _log("[radarilt] ERROR: dobby"); return; }
     auto dobbyHook = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
     if (!dobbyHook) { _log("[radarilt] ERROR: DobbyHook sym"); return; }
-    _log("[radarilt] Dobby OK");
 
-    // Hook 1: TransformRadarPointToScreenSpace
     {
         void* t = (void*)(base + OFF_TransformRPtoSS + 1);
         int r = dobbyHook(t, (void*)hk_Transform, (void**)&orig_Transform);
-        _logf("[radarilt] Hook Transform: ret=%d orig=0x%08X",
-              r, (unsigned)(uintptr_t)orig_Transform);
+        _logf("[radarilt] Hook Transform: ret=%d", r);
     }
-
-    // Hook 2: DrawRadarMap (diagnostic saja)
     {
         void* t = (void*)(base + OFF_DrawRadarMap + 1);
         int r = dobbyHook(t, (void*)hk_DrawRadarMap, (void**)&orig_DrawRadarMap);
-        _logf("[radarilt] Hook DrawRadarMap: ret=%d orig=0x%08X",
-              r, (unsigned)(uintptr_t)orig_DrawRadarMap);
+        _logf("[radarilt] Hook DrawRadarMap: ret=%d", r);
     }
 
+    _logf("[radarilt] TILT=%.2f, sampling %d points before lock", TILT, SAMPLE_LOCK);
     _log("[radarilt] === OnModLoad SELESAI ===");
-    if (aml) aml->ShowToast(false, "[RadarTilt] v1.2 Aktif");
+    if (aml) aml->ShowToast(false, "[RadarTilt] v1.3 Aktif");
 }
