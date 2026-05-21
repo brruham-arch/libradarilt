@@ -1,6 +1,6 @@
-// libradarilt v1.4 - DIAGNOSTIC ONLY
-// Hook semua fungsi radar, log mana yang terpanggil saat ingame.
-// Tidak ada modifikasi visual — murni untuk identifikasi call chain.
+// libradarilt v1.5
+// TransformRPtoSS confirmed dipanggil. Fix: bounds dari in.y == ±1 exact.
+// in.y range persis [-1, +1] untuk tile radar, kita pakai itu langsung.
 
 #include <stdint.h>
 #include <stdio.h>
@@ -25,98 +25,101 @@ static void _logf(const char* fmt, ...) {
     _log(buf);
 }
 
-// ─── Offsets ──────────────────────────────────────────────────────────────────
-#define OFF_CHud_DrawRadar            0x00437ABCu  // CHud::DrawRadar
-#define OFF_DrawRadarMap              0x0043E5A0u  // CRadar::DrawRadarMap
-#define OFF_DrawBlips                 0x0043E99Cu  // CRadar::DrawBlips(float)
-#define OFF_DrawRadarMask             0x00444150u  // CRadar::DrawRadarMask
-#define OFF_DrawRadarSection          0x004437B0u  // CRadar::DrawRadarSection(int,int,int)
-#define OFF_DrawRadarSectionMap       0x00443B40u  // CRadar::DrawRadarSectionMap
-#define OFF_TransformRPtoSS           0x0043F5DCu  // TransformRadarPointToScreenSpace
-#define OFF_TransformRWtoRS           0x0043F694u  // TransformRealWorldPointToRadarSpace
-#define OFF_DrawCoordBlip             0x0043FA18u  // DrawCoordBlip
-#define OFF_DrawEntityBlip            0x0043FED4u  // DrawEntityBlip
-#define OFF_DrawRadarSprite           0x0043F764u  // DrawRadarSprite
-#define OFF_DrawRotatingRadarSprite   0x00441088u  // DrawRotatingRadarSprite
+#define OFF_TransformRPtoSS  0x0043F5DCu
+#define OFF_DrawBlips        0x0043E99Cu
 
 struct CVector2D { float x, y; };
 
-typedef void (*tVoid)(void);
-typedef void (*tVoidF)(float);
-typedef void (*tVoidIII)(int,int,int);
-typedef void (*tTransform)(CVector2D&, const CVector2D&);
+// ─── Tilt ─────────────────────────────────────────────────────────────────────
+// TILT_TOP: skala Y sisi atas radar (in.y = -1). < 1.0 = dikompres ke center.
+// TILT_BOT: skala Y sisi bawah radar (in.y = +1). 1.0 = normal.
+// Efek: atas "mundur", bawah "maju" → kesan miring 3D.
+#define TILT_TOP  0.55f
+#define TILT_BOT  1.00f
 
-// ─── Per-fungsi: flag sudah-dipanggil + orig pointer ─────────────────────────
-#define MAKE_HOOK(NAME) \
-    static bool       called_##NAME = false; \
-    static tVoid      orig_##NAME   = nullptr; \
-    static void hk_##NAME() { \
-        if (!called_##NAME) { _log("[radarilt] CALLED: " #NAME); called_##NAME = true; } \
-        if (orig_##NAME) orig_##NAME(); \
+// Kita derive screen center Y dari pasangan:
+//   in.y = -1.0 → out.y = top_screen
+//   in.y = +1.0 → out.y = bot_screen
+// Catat keduanya, lalu lock.
+
+static float g_topY    = 0.0f;
+static float g_botY    = 0.0f;
+static bool  g_hasTop  = false;
+static bool  g_hasBot  = false;
+static bool  g_ready   = false;
+static float g_centerY = 0.0f;
+
+// Toleransi: in.y dianggap -1 atau +1 jika dalam range ini
+#define EDGE_TOL 0.02f
+
+// ─── Hook TransformRPtoSS ─────────────────────────────────────────────────────
+typedef void (*tTransform)(CVector2D&, const CVector2D&);
+static tTransform orig_Transform = nullptr;
+
+static void hk_Transform(CVector2D& out, const CVector2D& in) {
+    orig_Transform(out, in);
+
+    // Fase 1: calibrasi - catat posisi tepi atas dan bawah radar di screen
+    if (!g_ready) {
+        if (!g_hasTop && in.y <= -1.0f + EDGE_TOL) {
+            g_topY   = out.y;
+            g_hasTop = true;
+            _logf("[radarilt] Calibrate TOP: in.y=%.3f out.y=%.1f", in.y, out.y);
+        }
+        if (!g_hasBot && in.y >= 1.0f - EDGE_TOL) {
+            g_botY   = out.y;
+            g_hasBot = true;
+            _logf("[radarilt] Calibrate BOT: in.y=%.3f out.y=%.1f", in.y, out.y);
+        }
+        if (g_hasTop && g_hasBot && g_botY > g_topY) {
+            g_centerY = (g_topY + g_botY) * 0.5f;
+            g_ready   = true;
+            _logf("[radarilt] READY: topY=%.1f botY=%.1f centerY=%.1f",
+                  g_topY, g_botY, g_centerY);
+        }
+        return;
     }
 
-MAKE_HOOK(DrawRadar)
-MAKE_HOOK(DrawRadarMap)
-MAKE_HOOK(DrawRadarMask)
+    // Fase 2: terapkan tilt
+    // t: 0 = atas (in.y=-1), 1 = bawah (in.y=+1)
+    float t     = (in.y + 1.0f) * 0.5f;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
 
-static bool   called_DrawBlips = false;
-static tVoidF orig_DrawBlips   = nullptr;
+    float scale = TILT_TOP + (TILT_BOT - TILT_TOP) * t;
+    float dy    = out.y - g_centerY;
+    out.y       = g_centerY + dy * scale;
+}
+
+// ─── Hook DrawBlips: reset kalibrasi tiap ~10 detik ──────────────────────────
+typedef void (*tVoidF)(float);
+static tVoidF orig_DrawBlips = nullptr;
+static int    g_blipFrame    = 0;
+
 static void hk_DrawBlips(float f) {
-    if (!called_DrawBlips) { _logf("[radarilt] CALLED: DrawBlips(%.3f)", f); called_DrawBlips = true; }
+    g_blipFrame++;
+    if (g_blipFrame % 600 == 0) {
+        g_hasTop = g_hasBot = g_ready = false;
+        _log("[radarilt] Recalibrate triggered");
+    }
     if (orig_DrawBlips) orig_DrawBlips(f);
 }
 
-static bool     called_DrawRadarSection = false;
-static tVoidIII orig_DrawRadarSection   = nullptr;
-static void hk_DrawRadarSection(int a, int b, int c) {
-    if (!called_DrawRadarSection) {
-        _logf("[radarilt] CALLED: DrawRadarSection(%d,%d,%d)", a, b, c);
-        called_DrawRadarSection = true;
-    }
-    if (orig_DrawRadarSection) orig_DrawRadarSection(a, b, c);
-}
-
-static bool      called_Transform = false;
-static tTransform orig_Transform  = nullptr;
-static void hk_Transform(CVector2D& out, const CVector2D& in) {
-    if (!called_Transform) {
-        orig_Transform(out, in);
-        _logf("[radarilt] CALLED: TransformRPtoSS in=(%.3f,%.3f) out=(%.3f,%.3f)",
-              in.x, in.y, out.x, out.y);
-        called_Transform = true;
-        return;
-    }
-    orig_Transform(out, in);
-}
-
-static bool      called_TransformRW = false;
-static tTransform orig_TransformRW  = nullptr;
-static void hk_TransformRW(CVector2D& out, const CVector2D& in) {
-    if (!called_TransformRW) {
-        orig_TransformRW(out, in);
-        _logf("[radarilt] CALLED: TransformRWtoRS in=(%.3f,%.3f) out=(%.3f,%.3f)",
-              in.x, in.y, out.x, out.y);
-        called_TransformRW = true;
-        return;
-    }
-    orig_TransformRW(out, in);
-}
-
 // ─── AML ──────────────────────────────────────────────────────────────────────
-MYMOD(brruham.libradarilt, libradarilt, 1.4, brruham)
+MYMOD(brruham.libradarilt, libradarilt, 1.5, brruham)
 
 ON_MOD_PRELOAD() {
     remove(LOGFILE);
-    _log("[radarilt] === v1.4 DIAGNOSTIC ===");
+    _log("[radarilt] === v1.5 ===");
 }
 
 ON_MOD_LOAD() {
-    _log("[radarilt] === OnModLoad ===");
+    _log("[radarilt] OnModLoad");
 
     uintptr_t base = 0;
     {
         FILE* maps = fopen("/proc/self/maps", "r");
-        if (!maps) { _log("[radarilt] ERROR: maps"); return; }
+        if (!maps) { _log("ERROR: maps"); return; }
         char line[512];
         while (fgets(line, sizeof(line), maps)) {
             if (strstr(line, "libGTASA.so") && strstr(line, "r-xp")) {
@@ -126,29 +129,23 @@ ON_MOD_LOAD() {
         }
         fclose(maps);
     }
-    if (!base) { _log("[radarilt] ERROR: base"); return; }
-    _logf("[radarilt] base = 0x%08X", (unsigned)base);
+    if (!base) { _log("ERROR: base"); return; }
+    _logf("[radarilt] base=0x%08X", (unsigned)base);
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hDobby) { _log("[radarilt] ERROR: dobby"); return; }
-    auto dobbyHook = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
-    if (!dobbyHook) { _log("[radarilt] ERROR: sym"); return; }
+    if (!hDobby) { _log("ERROR: dobby"); return; }
+    auto dHook = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
+    if (!dHook) { _log("ERROR: sym"); return; }
 
-#define HOOK(NAME, OFF, hk, orig) { \
-    void* t = (void*)(base + (OFF) + 1); \
-    int r = dobbyHook(t, (void*)(hk), (void**)(orig)); \
-    _logf("[radarilt] hook %-30s ret=%d", #NAME, r); \
-}
+    void* tT = (void*)(base + OFF_TransformRPtoSS + 1);
+    int rT = dHook(tT, (void*)hk_Transform, (void**)&orig_Transform);
+    _logf("[radarilt] Hook Transform ret=%d", rT);
 
-    HOOK(CHud_DrawRadar,          OFF_CHud_DrawRadar,          hk_DrawRadar,          &orig_DrawRadar)
-    HOOK(DrawRadarMap,            OFF_DrawRadarMap,             hk_DrawRadarMap,       &orig_DrawRadarMap)
-    HOOK(DrawRadarMask,           OFF_DrawRadarMask,            hk_DrawRadarMask,      &orig_DrawRadarMask)
-    HOOK(DrawBlips,               OFF_DrawBlips,                hk_DrawBlips,          &orig_DrawBlips)
-    HOOK(DrawRadarSection,        OFF_DrawRadarSection,         hk_DrawRadarSection,   &orig_DrawRadarSection)
-    HOOK(TransformRPtoSS,         OFF_TransformRPtoSS,          hk_Transform,          &orig_Transform)
-    HOOK(TransformRWtoRS,         OFF_TransformRWtoRS,          hk_TransformRW,        &orig_TransformRW)
+    void* tB = (void*)(base + OFF_DrawBlips + 1);
+    int rB = dHook(tB, (void*)hk_DrawBlips, (void**)&orig_DrawBlips);
+    _logf("[radarilt] Hook DrawBlips ret=%d", rB);
 
-    _log("[radarilt] Semua hook terpasang. Masuk game, lihat mana yang CALLED.");
-    _log("[radarilt] === OnModLoad SELESAI ===");
-    if (aml) aml->ShowToast(false, "[RadarTilt] v1.4 Diagnostic");
+    _logf("[radarilt] TILT top=%.2f bot=%.2f", TILT_TOP, TILT_BOT);
+    _log("[radarilt] SELESAI");
+    if (aml) aml->ShowToast(false, "[RadarTilt] v1.5");
 }
