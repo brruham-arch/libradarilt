@@ -128,15 +128,31 @@ ON_MOD_PRELOAD() {
 ON_MOD_LOAD() {
     _log("[radarilt] === OnModLoad mulai ===");
 
-    // ── 1. Ambil base address libGTASA.so ────────────────────────────────────
-    void* hGTASA = dlopen("libGTASA.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!hGTASA) {
-        _log("[radarilt] ERROR: dlopen libGTASA.so gagal");
-        if (aml) aml->ShowToast(true, "[RadarTilt] ERROR: libGTASA tidak ditemukan");
+    // ── 1. Ambil base address libGTASA.so dari /proc/self/maps ───────────────
+    uintptr_t base = 0;
+    {
+        FILE* maps = fopen("/proc/self/maps", "r");
+        if (!maps) {
+            _log("[radarilt] ERROR: gagal buka /proc/self/maps");
+            if (aml) aml->ShowToast(true, "[RadarTilt] ERROR: /proc/self/maps");
+            return;
+        }
+        char line[512];
+        while (fgets(line, sizeof(line), maps)) {
+            if (strstr(line, "libGTASA.so") && strstr(line, "r-xp")) {
+                base = (uintptr_t)strtoul(line, nullptr, 16);
+                _logf("[radarilt] maps hit: %s", line);
+                break;
+            }
+        }
+        fclose(maps);
+    }
+    if (!base) {
+        _log("[radarilt] ERROR: libGTASA.so r-xp tidak ditemukan di maps");
+        if (aml) aml->ShowToast(true, "[RadarTilt] ERROR: base not found");
         return;
     }
-    uintptr_t base = (uintptr_t)hGTASA;
-    _logf("[radarilt] libGTASA.so base = 0x%08X", (unsigned)base);
+    _logf("[radarilt] libGTASA.so base (maps) = 0x%08X", (unsigned)base);
 
     // ── 2. Resolve alamat fungsi GL emu ──────────────────────────────────────
     // Thumb2: semua address + 1 untuk mode indicator,
