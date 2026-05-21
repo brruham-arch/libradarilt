@@ -1,10 +1,12 @@
-// libradarilt - CHud::DrawRadar 3D tilt effect
+// libradarilt - minimap pseudo-3D tilt
 // Target: libGTASA.so ARM32 Thumb2
-// Offsets confirmed via readelf/nm analysis
 //
-// Hook: CHud::DrawRadar @ 0x00437ABC
-// Inject emu_glPushMatrix + emu_glMultMatrixf (tilt) + emu_glPopMatrix
-// around the original call to produce a pseudo-3D perspective tilt.
+// Strategi: hook TransformRadarPointToScreenSpace
+// Fungsi ini konversi koordinat radar (normalized) → screen pixel.
+// Kita inject shear transform di sini untuk efek tilt perspektif.
+//
+// CRadar::TransformRadarPointToScreenSpace @ 0x0043F5DC
+// void (CVector2D& out, const CVector2D& in)
 
 #include <stdint.h>
 #include <stdio.h>
@@ -16,125 +18,120 @@
 
 #include "mod/amlmod.h"
 
-// ─── Logging ────────────────────────────────────────────────────────────────
+// ─── Logging ─────────────────────────────────────────────────────────────────
 
-#define LOG_TAG   "libradarilt"
-#define LOGFILE   "/storage/emulated/0/radarilt_log.txt"
+#define LOG_TAG  "libradarilt"
+#define LOGFILE  "/storage/emulated/0/radarilt_log.txt"
 
 static void _log(const char* msg) {
     __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, "%s", msg);
     FILE* f = fopen(LOGFILE, "a");
     if (f) { fputs(msg, f); fputc('\n', f); fclose(f); }
 }
-
 static void _logf(const char* fmt, ...) {
     char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
     _log(buf);
 }
 
-// ─── Offsets (dari readelf/nm - sudah verified) ──────────────────────────────
+// ─── Offset ──────────────────────────────────────────────────────────────────
 //
-// Semua offset RELATIVE to libGTASA.so base.
-// Fungsi ARM Thumb2: hook address = base + offset + 1 (Thumb bit)
+// TransformRadarPointToScreenSpace @ 0x0043F5DC (confirmed dari readelf)
+// DrawRadar                        @ 0x00437ABC (untuk referensi)
+// m_radarRect                      @ 0x00994DB0 (CRect: x1,y1,x2,y2 float)
+
+#define OFF_TransformRPtoSS  0x0043F5DCu
+#define OFF_m_radarRect      0x00994DB0u
+
+// ─── CVector2D struct ─────────────────────────────────────────────────────────
+
+struct CVector2D {
+    float x, y;
+};
+
+// ─── Tilt parameter ───────────────────────────────────────────────────────────
 //
-//   CHud::DrawRadar              0x00437ABC  → hook target
-//   emu_glPushMatrix             0x001BA74D  → push GL matrix stack
-//   emu_glPopMatrix              0x001BA85D  → pop GL matrix stack
-//   emu_glMultMatrixf(float*)    0x001BA995  → multiply current matrix
-//   emu_glRotate(f,f,f,f,f)     0x001BAB49  → rotate (angle,x,y,z) float ver
-//   emu_glTranslate(f,f,f,f)    0x001BAE8D  → translate
-
-#define OFF_DrawRadar    0x00437ABCu
-#define OFF_PushMatrix   0x001BA74Du
-#define OFF_PopMatrix    0x001BA85Du
-#define OFF_MultMatrixf  0x001BA995u
-#define OFF_Rotate       0x001BAB49u
-#define OFF_Translate    0x001BAE8Du
-
-// ─── Tilt matrix ─────────────────────────────────────────────────────────────
+// Efek pseudo-3D: bagian atas minimap "jauh", bagian bawah "dekat".
+// Implementasi via perspective-like Y compression + shear:
 //
-// Efek "minimap miring ke depan" = rotasi sumbu X ~25 derajat.
-// Pakai OpenGL column-major matrix 4x4.
+//   t = (in.y + 1.0) / 2.0   (0 = atas, 1 = bawah, normalized dari [-1,1])
+//   scale_y = SCALE_TOP + (SCALE_BOT - SCALE_TOP) * t
+//   out.y = center_y + (in.y * scale_y * half_h)
+//   out.x = center_x + (in.x * half_w)             (X tidak berubah)
 //
-// Rotasi X sebesar angle θ:
-//   [ 1    0       0     0 ]
-//   [ 0  cos θ  -sin θ   0 ]
-//   [ 0  sin θ   cos θ   0 ]
-//   [ 0    0       0     1 ]
-//
-// θ = 25° → cos(25°) ≈ 0.9063, sin(25°) ≈ 0.4226
-// Nilai ini bisa diubah via TILT_ANGLE_DEG di bawah.
+// TILT_SCALE_TOP: skala Y di bagian atas (lebih kecil = terlihat "jauh")
+// TILT_SCALE_BOT: skala Y di bagian bawah (lebih besar = terlihat "dekat")
 
-#define TILT_ANGLE_DEG  25.0f
+#define TILT_SCALE_TOP  0.55f   // atas terkompresi (jauh)
+#define TILT_SCALE_BOT  1.00f   // bawah normal (dekat)
 
-static float g_tiltMatrix[16];
+// ─── State: posisi & ukuran radar di layar ────────────────────────────────────
+// Diambil dari m_radarRect saat pertama kali hook dipanggil.
 
-static void buildTiltMatrix(float deg) {
-    float rad  = deg * 3.14159265f / 180.0f;
-    float c    = cosf(rad);
-    float s    = sinf(rad);
+static float g_cx = 0.0f;   // center X radar di screen
+static float g_cy = 0.0f;   // center Y radar di screen
+static float g_hw = 0.0f;   // half width
+static float g_hh = 0.0f;   // half height
+static bool  g_rectReady = false;
+static uintptr_t g_base = 0;
 
-    // Column-major, row index berubah cepat
-    g_tiltMatrix[0]  = 1.0f; g_tiltMatrix[4]  = 0.0f; g_tiltMatrix[8]  = 0.0f;  g_tiltMatrix[12] = 0.0f;
-    g_tiltMatrix[1]  = 0.0f; g_tiltMatrix[5]  = c;    g_tiltMatrix[9]  = -s;    g_tiltMatrix[13] = 0.0f;
-    g_tiltMatrix[2]  = 0.0f; g_tiltMatrix[6]  = s;    g_tiltMatrix[10] = c;     g_tiltMatrix[14] = 0.0f;
-    g_tiltMatrix[3]  = 0.0f; g_tiltMatrix[7]  = 0.0f; g_tiltMatrix[11] = 0.0f;  g_tiltMatrix[15] = 1.0f;
+static void updateRadarRect() {
+    if (!g_base) return;
+    // m_radarRect = CRect { float x1, y1, x2, y2 }
+    float* r = (float*)(g_base + OFF_m_radarRect);
+    float x1 = r[0], y1 = r[1], x2 = r[2], y2 = r[3];
+    if (x2 <= x1 || y2 <= y1) return;
+    g_cx = (x1 + x2) * 0.5f;
+    g_cy = (y1 + y2) * 0.5f;
+    g_hw = (x2 - x1) * 0.5f;
+    g_hh = (y2 - y1) * 0.5f;
+    g_rectReady = true;
 }
 
-// ─── Function pointer types ──────────────────────────────────────────────────
+// ─── Hook ─────────────────────────────────────────────────────────────────────
 
-typedef void (*tVoid)(void);
-typedef void (*tMultMatrixf)(const float*);
-typedef void (*tRotatef)(float angle, float x, float y, float z, float unused);
-typedef void (*tTranslatef)(float x, float y, float z, float unused);
+typedef void (*tTransform)(CVector2D& out, const CVector2D& in);
+static tTransform orig_Transform = nullptr;
 
-static tVoid         fn_Push        = nullptr;
-static tVoid         fn_Pop         = nullptr;
-static tMultMatrixf  fn_MultMatrixf = nullptr;
+static void hk_Transform(CVector2D& out, const CVector2D& in) {
+    // Panggil original dulu → dapat koordinat screen asli
+    orig_Transform(out, in);
 
-// Original DrawRadar yang disimpan Dobby
-static tVoid orig_DrawRadar = nullptr;
+    if (!g_rectReady) updateRadarRect();
+    if (!g_rectReady) return;
 
-// ─── Hook function ───────────────────────────────────────────────────────────
+    // in.y range: -1 (atas) sampai +1 (bawah) dalam radar space
+    // t = 0 di atas, 1 di bawah
+    float t = (in.y + 1.0f) * 0.5f;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
 
-static void hk_DrawRadar() {
-    if (!fn_Push || !fn_Pop || !fn_MultMatrixf || !orig_DrawRadar) {
-        // Fallback: panggil original tanpa efek jika pointer belum siap
-        if (orig_DrawRadar) orig_DrawRadar();
-        return;
-    }
+    float scaleY = TILT_SCALE_TOP + (TILT_SCALE_BOT - TILT_SCALE_TOP) * t;
 
-    fn_Push();
-    fn_MultMatrixf(g_tiltMatrix);
-    orig_DrawRadar();
-    fn_Pop();
+    // Terapkan scale Y relatif terhadap center radar
+    float dy = out.y - g_cy;
+    out.y = g_cy + dy * scaleY;
 }
 
-// ─── AML MYMOD ───────────────────────────────────────────────────────────────
+// ─── AML setup ───────────────────────────────────────────────────────────────
 
-MYMOD(brruham.libradarilt, libradarilt, 1.0, brruham)
+MYMOD(brruham.libradarilt, libradarilt, 1.1, brruham)
 
 ON_MOD_PRELOAD() {
-    // Hapus log lama
     remove(LOGFILE);
     _log("[radarilt] === OnModPreLoad ===");
-    _log("[radarilt] v1.0 | CHud::DrawRadar tilt mod | brruham");
+    _log("[radarilt] v1.1 | TransformRadarPointToScreenSpace tilt | brruham");
 }
 
 ON_MOD_LOAD() {
     _log("[radarilt] === OnModLoad mulai ===");
 
-    // ── 1. Ambil base address libGTASA.so dari /proc/self/maps ───────────────
+    // ── 1. Base address dari /proc/self/maps ──────────────────────────────────
     uintptr_t base = 0;
     {
         FILE* maps = fopen("/proc/self/maps", "r");
         if (!maps) {
             _log("[radarilt] ERROR: gagal buka /proc/self/maps");
-            if (aml) aml->ShowToast(true, "[RadarTilt] ERROR: /proc/self/maps");
             return;
         }
         char line[512];
@@ -148,82 +145,44 @@ ON_MOD_LOAD() {
         fclose(maps);
     }
     if (!base) {
-        _log("[radarilt] ERROR: libGTASA.so r-xp tidak ditemukan di maps");
+        _log("[radarilt] ERROR: libGTASA.so tidak ditemukan di maps");
         if (aml) aml->ShowToast(true, "[RadarTilt] ERROR: base not found");
         return;
     }
-    _logf("[radarilt] libGTASA.so base (maps) = 0x%08X", (unsigned)base);
+    _logf("[radarilt] base = 0x%08X", (unsigned)base);
+    g_base = base;
 
-    // ── 2. Resolve alamat fungsi GL emu ──────────────────────────────────────
-    // Thumb2: semua address + 1 untuk mode indicator,
-    // tapi kita simpan sebagai pointer biasa (tanpa +1) untuk call langsung.
-    // DobbyHook yang butuh +1, call biasa tidak.
+    // ── 2. Log m_radarRect address (baca nanti saat hook dipanggil) ───────────
+    _logf("[radarilt] m_radarRect addr = 0x%08X", (unsigned)(base + OFF_m_radarRect));
 
-    fn_Push       = (tVoid)       (base + OFF_PushMatrix);
-    fn_Pop        = (tVoid)       (base + OFF_PopMatrix);
-    fn_MultMatrixf = (tMultMatrixf)(base + OFF_MultMatrixf);
-
-    _logf("[radarilt] emu_glPushMatrix   @ 0x%08X", (unsigned)(base + OFF_PushMatrix));
-    _logf("[radarilt] emu_glPopMatrix    @ 0x%08X", (unsigned)(base + OFF_PopMatrix));
-    _logf("[radarilt] emu_glMultMatrixf  @ 0x%08X", (unsigned)(base + OFF_MultMatrixf));
-
-    // Validasi pointer tidak null (base 0 = library tidak loaded)
-    if (!fn_Push || !fn_Pop || !fn_MultMatrixf) {
-        _log("[radarilt] ERROR: satu atau lebih pointer GL null");
-        if (aml) aml->ShowToast(true, "[RadarTilt] ERROR: GL pointer null");
-        return;
-    }
-    _log("[radarilt] GL emu pointers OK");
-
-    // ── 3. Build tilt matrix ─────────────────────────────────────────────────
-    buildTiltMatrix(TILT_ANGLE_DEG);
-    _logf("[radarilt] Tilt matrix built, angle=%.1f deg", TILT_ANGLE_DEG);
-    _logf("[radarilt] Matrix[0..3] = %.4f %.4f %.4f %.4f",
-          g_tiltMatrix[0], g_tiltMatrix[1], g_tiltMatrix[2], g_tiltMatrix[3]);
-    _logf("[radarilt] Matrix[4..7] = %.4f %.4f %.4f %.4f",
-          g_tiltMatrix[4], g_tiltMatrix[5], g_tiltMatrix[6], g_tiltMatrix[7]);
-    _logf("[radarilt] Matrix[8..11]= %.4f %.4f %.4f %.4f",
-          g_tiltMatrix[8], g_tiltMatrix[9], g_tiltMatrix[10], g_tiltMatrix[11]);
-
-    // ── 4. Load Dobby ────────────────────────────────────────────────────────
+    // ── 3. Load Dobby ─────────────────────────────────────────────────────────
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) {
-        _log("[radarilt] ERROR: dlopen libdobby.so gagal");
-        if (aml) aml->ShowToast(true, "[RadarTilt] ERROR: libdobby tidak ditemukan");
+        _log("[radarilt] ERROR: libdobby.so tidak ditemukan");
+        if (aml) aml->ShowToast(true, "[RadarTilt] ERROR: libdobby");
         return;
     }
-    _log("[radarilt] libdobby.so loaded OK");
-
-    auto dobbyHook = (int(*)(void*, void*, void**))dlsym(hDobby, "DobbyHook");
+    auto dobbyHook = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
     if (!dobbyHook) {
-        _log("[radarilt] ERROR: DobbyHook symbol tidak ditemukan");
-        if (aml) aml->ShowToast(true, "[RadarTilt] ERROR: DobbyHook sym null");
+        _log("[radarilt] ERROR: DobbyHook sym null");
         return;
     }
-    _log("[radarilt] DobbyHook symbol OK");
+    _log("[radarilt] Dobby OK");
 
-    // ── 5. Hook CHud::DrawRadar ──────────────────────────────────────────────
-    // Thumb2 hook: address + 1 (Thumb bit)
-    void* drawRadarAddr = (void*)(base + OFF_DrawRadar + 1);
-    _logf("[radarilt] CHud::DrawRadar target = 0x%08X (offset=0x%08X + base + 1)",
-          (unsigned)(uintptr_t)drawRadarAddr, OFF_DrawRadar);
+    // ── 4. Hook TransformRadarPointToScreenSpace ──────────────────────────────
+    void* target = (void*)(base + OFF_TransformRPtoSS + 1); // +1 Thumb
+    _logf("[radarilt] Transform target = 0x%08X", (unsigned)(uintptr_t)target);
 
-    int hookRet = dobbyHook(
-        drawRadarAddr,
-        (void*)hk_DrawRadar,
-        (void**)&orig_DrawRadar
-    );
-
-    if (hookRet != 0) {
-        _logf("[radarilt] ERROR: DobbyHook gagal, ret=%d", hookRet);
-        if (aml) aml->ShowToast(true, "[RadarTilt] ERROR: Hook gagal (ret=%d)", hookRet);
+    int ret = dobbyHook(target, (void*)hk_Transform, (void**)&orig_Transform);
+    if (ret != 0) {
+        _logf("[radarilt] ERROR: DobbyHook gagal ret=%d", ret);
+        if (aml) aml->ShowToast(true, "[RadarTilt] ERROR: hook gagal");
         return;
     }
+    _logf("[radarilt] Hook OK! orig = 0x%08X", (unsigned)(uintptr_t)orig_Transform);
 
-    _logf("[radarilt] Hook sukses! orig_DrawRadar = 0x%08X",
-          (unsigned)(uintptr_t)orig_DrawRadar);
-
-    // ── 6. Done ──────────────────────────────────────────────────────────────
+    // ── 5. Done ───────────────────────────────────────────────────────────────
+    _logf("[radarilt] Tilt: top=%.2f bot=%.2f", TILT_SCALE_TOP, TILT_SCALE_BOT);
     _log("[radarilt] === OnModLoad SELESAI ===");
-    if (aml) aml->ShowToast(false, "[RadarTilt] Aktif - tilt %.0f deg", TILT_ANGLE_DEG);
+    if (aml) aml->ShowToast(false, "[RadarTilt] v1.1 Aktif");
 }
