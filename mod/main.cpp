@@ -34,7 +34,7 @@ struct CVector2D { float x, y; };
 // TILT_TOP: skala Y sisi atas radar (in.y = -1). < 1.0 = dikompres ke center.
 // TILT_BOT: skala Y sisi bawah radar (in.y = +1). 1.0 = normal.
 // Efek: atas "mundur", bawah "maju" → kesan miring 3D.
-#define TILT_TOP  0.55f
+#define TILT_TOP  0.10f
 #define TILT_BOT  1.00f
 
 // Kita derive screen center Y dari pasangan:
