@@ -86,9 +86,18 @@ static void hk_Transform(CVector2D& out, const CVector2D& in) {
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
 
-    float scale = TILT_TOP + (TILT_BOT - TILT_TOP) * t;
-    float dy    = out.y - g_centerY;
-    out.y       = g_centerY + dy * scale;
+    float scale  = TILT_TOP + (TILT_BOT - TILT_TOP) * t;
+    float dy     = out.y - g_centerY;
+    float origY  = out.y;
+    out.y        = g_centerY + dy * scale;
+
+    // Log 5 sample pertama setelah READY untuk verifikasi
+    static int dbgN = 0;
+    if (dbgN < 5) {
+        _logf("[radarilt] TILT applied: in.y=%.3f origY=%.1f newY=%.1f scale=%.3f",
+              in.y, origY, out.y, scale);
+        dbgN++;
+    }
 }
 
 // ─── Hook DrawBlips: reset kalibrasi tiap ~10 detik ──────────────────────────
