@@ -1,13 +1,4 @@
-// libradarilt v1.6
-// CHud::DrawRadar membaca radar rect dari struct[r8] offset 32,36,40,44
-// (x1,y1,x2,y2 sebagai float).
-// Kita hook DrawRadar, modif y1 sementara untuk efek tilt, restore setelah.
-//
-// Dari disassembly:
-//   r0 = global ptr chain → r0[0x284] = r8 = radar struct
-//   r8[32] = x1, r8[36] = y1, r8[40] = x2, r8[44] = y2  (screen coords)
-//
-// Tilt: naikkan y1 (tepi atas) → atas radar "menyempit" → kesan miring
+// libradarilt v1.7 - diagnostic pointer chain + fallback CWidgetRadar
 
 #include <stdint.h>
 #include <stdio.h>
@@ -32,150 +23,126 @@ static void _logf(const char* fmt, ...) {
     _log(buf);
 }
 
-// ─── Offsets ──────────────────────────────────────────────────────────────────
-#define OFF_DrawRadar    0x00437ABCu
-// Global pointer chain dari DrawRadar disassembly:
-//   ldr r0, [pc+0x4ac] → add r0,pc → ldr r0,[r0] → r0[0x284] = radar_struct
-// Kita ambil global pointer ini secara langsung dari binary.
-// Dari 437b32: ldr r0,[pc,#0x4ac] → PC=0x437b36, offset=0x4ac → addr=0x437FE2
-// Isi 0x437FE2 = 0x00240019 (little-endian) → relative offset
-// Terlalu risky parse manual. Lebih aman: baca dari r8 saat hook dipanggil.
-// Kita hook DrawRadar, tapi kita TIDAK punya akses r8 langsung di C hook.
-//
-// Solusi: hook SETELAH prolog, atau simpan pointer saat DrawBlips dipanggil
-// (DrawBlips dipanggil di akhir DrawRadar, r8 masih valid di scope DrawRadar).
-//
-// ALTERNATIF LEBIH SIMPEL:
-// Hook DrawRadarMap (dipanggil dari DrawRadar).
-// Di dalam DrawRadarMap, baca m_radarRect via pointer chain yang sama.
-// Patch y1 sebelum DrawRadarMap, restore sesudah → tile radar ter-tilt.
-// Blip ikut ter-tilt karena TransformRPtoSS juga baca rect yang sama.
+#define OFF_DrawRadarMap   0x0043E5A0u
+#define OFF_DrawBlips      0x0043E99Cu
+// CWidgetRadar::Update @ 0x002BF798 - ini update posisi widget radar
+// r4 = CWidgetRadar*, r4[0x88] = pointer ke sesuatu (lihat disassembly)
+// r4[32..44] = x1,y1,x2,y2 dari widget (screen coords, ditulis ke r0[12..24])
+// r0 = r4[0x88]
+#define OFF_WidgetUpdate   0x002BF798u
 
-// Dari disassembly TransformRPtoSS cabang 0x43f618:
-//   ldr r2,[pc+0x74] → PC=0x43f61c, +0x74 = 0x43f690
-//   isi 0x43f690 = ?? → add r2,pc → ldr r2,[r2] → r2[0x284] = radar_struct
-// Sama persis dengan DrawRadar. Ini SATU global pointer.
-//
-// Kita resolve pointer ini saat runtime via DobbySymbolResolver atau
-// baca langsung dari /proc/self/maps + parse offset dari binary.
-//
-// CARA PALING ROBUST: patch inline di hook DrawRadarMap.
-// Kita punya base. Baca 4 byte di 0x43F690 (PC-relative pointer table):
-//   val = *(uint32_t*)(base + 0x43F690)  (ini relative offset dari PC 0x43F692)
-//   ptr_addr = 0x43F692 + val  (PC at that instruction)
-//   global_ptr = *(uint32_t*)(base + ptr_addr)
-//   radar_struct = *(uint32_t*)(global_ptr + 0x284)
-//   y1 = *(float*)(radar_struct + 36)
-//   y2 = *(float*)(radar_struct + 44)
+#define TILT_FACTOR 0.30f
 
-#define OFF_DrawRadarMap  0x0043E5A0u
-#define OFF_DrawBlips     0x0043E99Cu
+static uintptr_t g_base    = 0;
+static bool      g_logged  = false;
 
-// PC-relative pointer resolve untuk global radar ptr
-// Dari 0x43f618: ldr r2,[pc,#0x74] → PC=0x43f61c → target=0x43f690
-// 0x43f690 berisi nilai relative ke PC 0x43f692
-#define OFF_PTR_TABLE     0x0043F690u  // lokasi 4-byte relative value
-#define PC_AT_PTR         0x0043F692u  // PC saat instruksi itu (thumb: addr+4 tapi ldr pc-rel = align4)
+// ─── Pointer chain dari DrawRadar disassembly ─────────────────────────────────
+// 437b32: ldr r0,[pc,#0x4ac] → PC=0x437b36 → literal at 0x437FE2
+// 0x437FE2 berisi relative offset (Thumb PC-rel: (PC & ~3) + offset)
+// PC = 0x437b36, align4 = 0x437b34, + 0x4ac = 0x437FE0 ... hmm
+// Mari hitung ulang dengan benar:
+// ldr.w r0,[pc,#0x4ac] di addr 0x437b32 (4-byte Thumb2 instruction)
+// PC = 0x437b32 + 4 = 0x437b36
+// target = (0x437b36 & ~3) + 0x4ac = 0x437b34 + 0x4ac = 0x437FE0
+// Jadi literal pool di 0x437FE0, bukan 0x437FE2
+#define OFF_LITERAL_DRAWRADAR  0x00437FE0u  // literal pool untuk global ptr
 
-// Tilt: berapa persen tinggi radar yang "diambil" dari atas
-// 0.3 = tepi atas naik 30% dari tinggi radar → sangat kentara
-#define TILT_FACTOR  0.30f
+// ─── Approach baru: scan memori untuk nilai rect yang masuk akal ─────────────
+// Dari v1.6 log: PTR_TABLE → global=0xDEC9D4F0
+// Kita log isi pointer chain step by step
 
-static uintptr_t g_base       = 0;
-static bool      g_logged     = false;
-static uintptr_t g_radarStruct = 0;  // cache pointer
+static uintptr_t resolveViaDrawRadar() {
+    // Dari 437b32: ldr.w r0,[pc,#0x4ac]
+    // PC=0x437b36, align4(PC)=0x437b34, +0x4ac = 0x437FE0
+    uint32_t rel       = *(uint32_t*)(g_base + OFF_LITERAL_DRAWRADAR);
+    // rel adalah offset dari PC 0x437b36 ke global var address
+    // add r0,pc → r0 = 0x437b36 + rel (tapi ini adalah address of pointer, bukan value)
+    uintptr_t ptr_addr = (g_base + 0x437b36) + rel;
+    uintptr_t ptr_val  = *(uintptr_t*)ptr_addr;
 
-static uintptr_t getRadarStruct() {
-    if (!g_base) return 0;
+    _logf("[radarilt] DrawRadar literal=0x%08X rel=0x%08X ptr_addr=0x%08X ptr_val=0x%08X",
+          (unsigned)(g_base+OFF_LITERAL_DRAWRADAR), rel,
+          (unsigned)ptr_addr, (unsigned)ptr_val);
 
-    // Resolve PC-relative pointer dari binary
-    // ldr r2,[pc,#0x74] di 0x43f618 → PC=0x43f61c → literal pool di 0x43f690
-    // Karena Thumb2: PC = instruksi_addr + 4, tapi ldr literal = align-down-4(PC+offset)
-    uint32_t rel   = *(uint32_t*)(g_base + OFF_PTR_TABLE);
-    // PC untuk instruksi di 0x43f618 (2 byte) = 0x43f618 + 4 = 0x43f61c
-    // ldr r2,[pc,#0x74]: target = (PC & ~3) + 0x74 = (0x43f61c & ~3) + 0x74
-    //                           = 0x43f618 + 0x74 = 0x43f690  ✓ sesuai
-    // Nilai di 0x43f690 = offset relatif dari PC 0x43f692 ke global var
-    uintptr_t global_ptr_addr = (g_base + PC_AT_PTR) + rel;
-    uintptr_t global_ptr      = *(uintptr_t*)global_ptr_addr;
-    if (!global_ptr) return 0;
+    if (!ptr_val) return 0;
+    uintptr_t radar_struct = *(uintptr_t*)(ptr_val + 0x284);
+    _logf("[radarilt] ptr_val[0x284]=0x%08X (radar_struct)", (unsigned)radar_struct);
 
-    uintptr_t radar_struct = *(uintptr_t*)(global_ptr + 0x284);
     return radar_struct;
 }
 
+// ─── Approach CWidgetRadar ────────────────────────────────────────────────────
+// Dari disassembly CWidgetRadar::Update:
+//   r4 = this (CWidgetRadar*)
+//   r4[0x88] = inner pointer (r0)
+//   r4[32]=x1, r4[36]=y1, r4[40]=x2, r4[44]=y2  (input widget bounds)
+//   Output ditulis ke r0[12], r0[16], r0[20], r0[24]
+// Kita hook Update, modif r4[36] dan r4[44] SEBELUM kalkulasi
+
+typedef void (*tWidgetUpdate)(void*);
+static tWidgetUpdate orig_WidgetUpdate = nullptr;
+static bool g_widgetLogged = false;
+
+static void hk_WidgetUpdate(void* self) {
+    float* x1 = (float*)((uintptr_t)self + 32);
+    float* y1 = (float*)((uintptr_t)self + 36);
+    float* x2 = (float*)((uintptr_t)self + 40);
+    float* y2 = (float*)((uintptr_t)self + 44);
+
+    if (!g_widgetLogged) {
+        _logf("[radarilt] WidgetUpdate self=0x%08X bounds=(%.1f,%.1f,%.1f,%.1f)",
+              (unsigned)(uintptr_t)self, *x1, *y1, *x2, *y2);
+        // Log inner pointer
+        void** inner = (void**)((uintptr_t)self + 0x88);
+        _logf("[radarilt] inner[0x88]=0x%08X", (unsigned)(uintptr_t)*inner);
+        if (*inner) {
+            float* ox1 = (float*)((uintptr_t)*inner + 12);
+            float* oy1 = (float*)((uintptr_t)*inner + 16);
+            float* ox2 = (float*)((uintptr_t)*inner + 20);
+            float* oy2 = (float*)((uintptr_t)*inner + 24);
+            _logf("[radarilt] inner output bounds=(%.1f,%.1f,%.1f,%.1f)",
+                  *ox1, *oy1, *ox2, *oy2);
+        }
+        g_widgetLogged = true;
+    }
+
+    float h = *y2 - *y1;
+    float savedY1 = *y1;
+    if (h > 0.0f && h < 2000.0f) {
+        *y1 += h * TILT_FACTOR;
+    }
+
+    orig_WidgetUpdate(self);
+
+    *y1 = savedY1;
+}
+
+// ─── DrawRadarMap hook: diagnostic pointer chain ──────────────────────────────
 typedef void (*tVoid)(void);
-typedef void (*tVoidF)(float);
-
-static tVoid  orig_DrawRadarMap = nullptr;
-static tVoidF orig_DrawBlips    = nullptr;
-
-// Simpan y1 asli untuk restore
-static float g_savedY1 = 0.0f;
-static bool  g_patched = false;
+static tVoid orig_DrawRadarMap = nullptr;
+static bool  g_drLogged = false;
 
 static void hk_DrawRadarMap() {
-    uintptr_t rs = getRadarStruct();
-
-    if (rs) {
-        float* x1 = (float*)(rs + 32);
-        float* y1 = (float*)(rs + 36);
-        float* x2 = (float*)(rs + 40);
-        float* y2 = (float*)(rs + 44);
-
-        if (!g_logged) {
-            _logf("[radarilt] radarStruct=0x%08X rect=(%.1f,%.1f,%.1f,%.1f)",
-                  (unsigned)rs, *x1, *y1, *x2, *y2);
-            g_logged = true;
+    if (!g_drLogged) {
+        uintptr_t rs = resolveViaDrawRadar();
+        if (rs) {
+            float* x1 = (float*)(rs + 32);
+            float* y1 = (float*)(rs + 36);
+            float* x2 = (float*)(rs + 40);
+            float* y2 = (float*)(rs + 44);
+            _logf("[radarilt] radarStruct rect=(%.1f,%.1f,%.1f,%.1f)",
+                  *x1, *y1, *x2, *y2);
         }
-
-        float h    = *y2 - *y1;
-        if (h > 0.0f && h < 2000.0f) {  // sanity check: nilai screen wajar
-            g_savedY1  = *y1;
-            *y1       += h * TILT_FACTOR;  // naikkan tepi atas
-            g_patched  = true;
-        }
+        g_drLogged = true;
     }
-
     orig_DrawRadarMap();
-
-    // Restore segera setelah DrawRadarMap selesai
-    if (g_patched && rs) {
-        float* y1  = (float*)(rs + 36);
-        *y1        = g_savedY1;
-        g_patched  = false;
-    }
 }
 
-static void hk_DrawBlips(float f) {
-    // DrawBlips juga baca radar struct untuk TransformRPtoSS
-    // Patch y1 juga di sini agar blip ikut ter-tilt
-    uintptr_t rs = getRadarStruct();
-    if (rs) {
-        float* y1  = (float*)(rs + 36);
-        float* y2  = (float*)(rs + 44);
-        float  h   = *y2 - *y1;
-        if (h > 0.0f && h < 2000.0f) {
-            g_savedY1 = *y1;
-            *y1      += h * TILT_FACTOR;
-            g_patched = true;
-        }
-    }
-
-    orig_DrawBlips(f);
-
-    if (g_patched && rs) {
-        float* y1 = (float*)(rs + 36);
-        *y1       = g_savedY1;
-        g_patched = false;
-    }
-}
-
-MYMOD(brruham.libradarilt, libradarilt, 1.6, brruham)
+MYMOD(brruham.libradarilt, libradarilt, 1.7, brruham)
 
 ON_MOD_PRELOAD() {
     remove(LOGFILE);
-    _log("[radarilt] === v1.6 ===");
+    _log("[radarilt] === v1.7 ===");
 }
 
 ON_MOD_LOAD() {
@@ -198,28 +165,25 @@ ON_MOD_LOAD() {
     g_base = base;
     _logf("[radarilt] base=0x%08X", (unsigned)base);
 
-    // Log nilai pointer table untuk verifikasi
-    uint32_t rel = *(uint32_t*)(base + OFF_PTR_TABLE);
-    _logf("[radarilt] PTR_TABLE val=0x%08X → global=0x%08X",
-          rel, (unsigned)((base + PC_AT_PTR) + rel));
-
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { _log("ERROR: dobby"); return; }
     auto dHook = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
     if (!dHook) { _log("ERROR: sym"); return; }
 
+    // Hook DrawRadarMap untuk diagnostic pointer chain
     {
         void* t = (void*)(base + OFF_DrawRadarMap + 1);
         int r = dHook(t, (void*)hk_DrawRadarMap, (void**)&orig_DrawRadarMap);
         _logf("[radarilt] Hook DrawRadarMap ret=%d", r);
     }
+
+    // Hook CWidgetRadar::Update - pendekatan alternatif
     {
-        void* t = (void*)(base + OFF_DrawBlips + 1);
-        int r = dHook(t, (void*)hk_DrawBlips, (void**)&orig_DrawBlips);
-        _logf("[radarilt] Hook DrawBlips ret=%d", r);
+        void* t = (void*)(base + OFF_WidgetUpdate + 1);
+        int r = dHook(t, (void*)hk_WidgetUpdate, (void**)&orig_WidgetUpdate);
+        _logf("[radarilt] Hook WidgetUpdate ret=%d", r);
     }
 
-    _logf("[radarilt] TILT_FACTOR=%.2f", TILT_FACTOR);
     _log("[radarilt] SELESAI");
-    if (aml) aml->ShowToast(false, "[RadarTilt] v1.6");
+    if (aml) aml->ShowToast(false, "[RadarTilt] v1.7");
 }
