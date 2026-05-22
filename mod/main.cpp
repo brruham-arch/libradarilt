@@ -1,4 +1,34 @@
-// libradarilt v1.7 - diagnostic pointer chain + fallback CWidgetRadar
+// libradarilt v1.8
+// CWidgetRadar::Update confirmed = jalur render.
+// bounds input = sentinel (1000000,-1000000,-1000000,1000000) = konvensi terbalik
+// inner[0x88] output bounds juga sentinel.
+//
+// Dari disassembly CWidgetRadar::Update:
+//   Input:  r4[32]=x1, r4[36]=y1, r4[40]=x2, r4[44]=y2
+//   Output ditulis ke r0[12], r0[16], r0[20], r0[24]
+//   r0 = r4[0x88]
+//
+// Konvensi: x1=1000000 x2=-1000000 → x1 > x2, y1 < y2 (flipped)
+// Center: cx = (x1+x2)/2 = 0, cy = (y1+y2)/2 = 0 (world coords, bukan screen)
+// halfW  = abs(x2-x1)/2 * scale_factor
+//
+// Output ke r0[12..24] = screen rect (x_left, x_right, y_top, y_bot) atau serupa
+// Kita patch OUTPUT setelah orig dipanggil, bukan input.
+//
+// Dari log: inner output = (1000000,-1000000,-1000000,1000000) juga sentinel
+// Berarti output belum diisi saat kita baca, atau offset salah.
+//
+// Re-read disassembly output stores:
+//   vstr s0, [r0, #12]   → r0[12] = left_x  (s0 = cx - halfW)  
+//   vstr s8, [r0, #16]   → r0[16] = right_x? (s8 = cx + halfW?)
+//   wait - dari kode:
+//   s6  = cx + halfW  → [r0+20]
+//   s8  = cy + halfH? → [r0+16]  -- ini Y_BOT
+//   s0  = cx - halfW  → [r0+12]  -- ini X_LEFT
+//   s2  = cy - halfH  → [r0+24]  -- ini Y_TOP
+//
+// Jadi layout r0: [12]=x_left, [16]=y_bot, [20]=x_right, [24]=y_top
+// Tilt = modif y_top dan y_bot relatif terhadap center Y
 
 #include <stdint.h>
 #include <stdio.h>
@@ -23,126 +53,65 @@ static void _logf(const char* fmt, ...) {
     _log(buf);
 }
 
-#define OFF_DrawRadarMap   0x0043E5A0u
-#define OFF_DrawBlips      0x0043E99Cu
-// CWidgetRadar::Update @ 0x002BF798 - ini update posisi widget radar
-// r4 = CWidgetRadar*, r4[0x88] = pointer ke sesuatu (lihat disassembly)
-// r4[32..44] = x1,y1,x2,y2 dari widget (screen coords, ditulis ke r0[12..24])
-// r0 = r4[0x88]
-#define OFF_WidgetUpdate   0x002BF798u
+#define OFF_WidgetUpdate  0x002BF798u
 
-#define TILT_FACTOR 0.30f
+// Tilt: kompres tepi atas radar
+// 0 = flat, 0.3 = 30% tinggi dikurangi dari atas
+#define TILT_FACTOR  0.30f
 
-static uintptr_t g_base    = 0;
-static bool      g_logged  = false;
-
-// ─── Pointer chain dari DrawRadar disassembly ─────────────────────────────────
-// 437b32: ldr r0,[pc,#0x4ac] → PC=0x437b36 → literal at 0x437FE2
-// 0x437FE2 berisi relative offset (Thumb PC-rel: (PC & ~3) + offset)
-// PC = 0x437b36, align4 = 0x437b34, + 0x4ac = 0x437FE0 ... hmm
-// Mari hitung ulang dengan benar:
-// ldr.w r0,[pc,#0x4ac] di addr 0x437b32 (4-byte Thumb2 instruction)
-// PC = 0x437b32 + 4 = 0x437b36
-// target = (0x437b36 & ~3) + 0x4ac = 0x437b34 + 0x4ac = 0x437FE0
-// Jadi literal pool di 0x437FE0, bukan 0x437FE2
-#define OFF_LITERAL_DRAWRADAR  0x00437FE0u  // literal pool untuk global ptr
-
-// ─── Approach baru: scan memori untuk nilai rect yang masuk akal ─────────────
-// Dari v1.6 log: PTR_TABLE → global=0xDEC9D4F0
-// Kita log isi pointer chain step by step
-
-static uintptr_t resolveViaDrawRadar() {
-    // Dari 437b32: ldr.w r0,[pc,#0x4ac]
-    // PC=0x437b36, align4(PC)=0x437b34, +0x4ac = 0x437FE0
-    uint32_t rel       = *(uint32_t*)(g_base + OFF_LITERAL_DRAWRADAR);
-    // rel adalah offset dari PC 0x437b36 ke global var address
-    // add r0,pc → r0 = 0x437b36 + rel (tapi ini adalah address of pointer, bukan value)
-    uintptr_t ptr_addr = (g_base + 0x437b36) + rel;
-    uintptr_t ptr_val  = *(uintptr_t*)ptr_addr;
-
-    _logf("[radarilt] DrawRadar literal=0x%08X rel=0x%08X ptr_addr=0x%08X ptr_val=0x%08X",
-          (unsigned)(g_base+OFF_LITERAL_DRAWRADAR), rel,
-          (unsigned)ptr_addr, (unsigned)ptr_val);
-
-    if (!ptr_val) return 0;
-    uintptr_t radar_struct = *(uintptr_t*)(ptr_val + 0x284);
-    _logf("[radarilt] ptr_val[0x284]=0x%08X (radar_struct)", (unsigned)radar_struct);
-
-    return radar_struct;
-}
-
-// ─── Approach CWidgetRadar ────────────────────────────────────────────────────
-// Dari disassembly CWidgetRadar::Update:
-//   r4 = this (CWidgetRadar*)
-//   r4[0x88] = inner pointer (r0)
-//   r4[32]=x1, r4[36]=y1, r4[40]=x2, r4[44]=y2  (input widget bounds)
-//   Output ditulis ke r0[12], r0[16], r0[20], r0[24]
-// Kita hook Update, modif r4[36] dan r4[44] SEBELUM kalkulasi
+static int g_logCount = 0;
 
 typedef void (*tWidgetUpdate)(void*);
 static tWidgetUpdate orig_WidgetUpdate = nullptr;
-static bool g_widgetLogged = false;
 
 static void hk_WidgetUpdate(void* self) {
-    float* x1 = (float*)((uintptr_t)self + 32);
-    float* y1 = (float*)((uintptr_t)self + 36);
-    float* x2 = (float*)((uintptr_t)self + 40);
-    float* y2 = (float*)((uintptr_t)self + 44);
-
-    if (!g_widgetLogged) {
-        _logf("[radarilt] WidgetUpdate self=0x%08X bounds=(%.1f,%.1f,%.1f,%.1f)",
-              (unsigned)(uintptr_t)self, *x1, *y1, *x2, *y2);
-        // Log inner pointer
-        void** inner = (void**)((uintptr_t)self + 0x88);
-        _logf("[radarilt] inner[0x88]=0x%08X", (unsigned)(uintptr_t)*inner);
-        if (*inner) {
-            float* ox1 = (float*)((uintptr_t)*inner + 12);
-            float* oy1 = (float*)((uintptr_t)*inner + 16);
-            float* ox2 = (float*)((uintptr_t)*inner + 20);
-            float* oy2 = (float*)((uintptr_t)*inner + 24);
-            _logf("[radarilt] inner output bounds=(%.1f,%.1f,%.1f,%.1f)",
-                  *ox1, *oy1, *ox2, *oy2);
-        }
-        g_widgetLogged = true;
-    }
-
-    float h = *y2 - *y1;
-    float savedY1 = *y1;
-    if (h > 0.0f && h < 2000.0f) {
-        *y1 += h * TILT_FACTOR;
-    }
-
+    // Panggil original dulu - biarkan dia hitung output
     orig_WidgetUpdate(self);
 
-    *y1 = savedY1;
-}
+    // Baca pointer inner dari self[0x88]
+    uintptr_t inner = *(uintptr_t*)((uintptr_t)self + 0x88);
+    if (!inner) return;
 
-// ─── DrawRadarMap hook: diagnostic pointer chain ──────────────────────────────
-typedef void (*tVoid)(void);
-static tVoid orig_DrawRadarMap = nullptr;
-static bool  g_drLogged = false;
+    // Output layout di inner (dari disassembly vstr):
+    //   [12] = x_left  (s0)
+    //   [16] = y_bot   (s8) -- perhatikan urutan dari vstr
+    //   [20] = x_right (s6)
+    //   [24] = y_top   (s2)
+    float* xl   = (float*)(inner + 12);
+    float* ybot = (float*)(inner + 16);
+    float* xr   = (float*)(inner + 20);
+    float* ytop = (float*)(inner + 24);
 
-static void hk_DrawRadarMap() {
-    if (!g_drLogged) {
-        uintptr_t rs = resolveViaDrawRadar();
-        if (rs) {
-            float* x1 = (float*)(rs + 32);
-            float* y1 = (float*)(rs + 36);
-            float* x2 = (float*)(rs + 40);
-            float* y2 = (float*)(rs + 44);
-            _logf("[radarilt] radarStruct rect=(%.1f,%.1f,%.1f,%.1f)",
-                  *x1, *y1, *x2, *y2);
-        }
-        g_drLogged = true;
+    // Log beberapa frame pertama untuk verifikasi nilai output
+    if (g_logCount < 5) {
+        _logf("[radarilt] inner output: xl=%.1f ybot=%.1f xr=%.1f ytop=%.1f",
+              *xl, *ybot, *xr, *ytop);
+        g_logCount++;
     }
-    orig_DrawRadarMap();
+
+    // Sanity check: nilai screen yang masuk akal (0-4000 pixel)
+    float h = *ybot - *ytop;  // tinggi radar di screen
+    if (h <= 0.0f || h > 2000.0f) {
+        // Coba swap: mungkin ytop > ybot
+        h = *ytop - *ybot;
+        if (h <= 0.0f || h > 2000.0f) return;
+
+        // Layout terbalik: ytop > ybot
+        // Tilt: kurangi ytop (perkecil dari atas)
+        *ytop -= h * TILT_FACTOR;
+        return;
+    }
+
+    // Layout normal: ybot > ytop
+    // Tilt: naikkan ytop (perkecil dari atas)
+    *ytop += h * TILT_FACTOR;
 }
 
-MYMOD(brruham.libradarilt, libradarilt, 1.7, brruham)
+MYMOD(brruham.libradarilt, libradarilt, 1.8, brruham)
 
 ON_MOD_PRELOAD() {
     remove(LOGFILE);
-    _log("[radarilt] === v1.7 ===");
+    _log("[radarilt] === v1.8 ===");
 }
 
 ON_MOD_LOAD() {
@@ -162,7 +131,6 @@ ON_MOD_LOAD() {
         fclose(maps);
     }
     if (!base) { _log("ERROR: base"); return; }
-    g_base = base;
     _logf("[radarilt] base=0x%08X", (unsigned)base);
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
@@ -170,20 +138,11 @@ ON_MOD_LOAD() {
     auto dHook = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
     if (!dHook) { _log("ERROR: sym"); return; }
 
-    // Hook DrawRadarMap untuk diagnostic pointer chain
-    {
-        void* t = (void*)(base + OFF_DrawRadarMap + 1);
-        int r = dHook(t, (void*)hk_DrawRadarMap, (void**)&orig_DrawRadarMap);
-        _logf("[radarilt] Hook DrawRadarMap ret=%d", r);
-    }
+    void* t = (void*)(base + OFF_WidgetUpdate + 1);
+    int r = dHook(t, (void*)hk_WidgetUpdate, (void**)&orig_WidgetUpdate);
+    _logf("[radarilt] Hook WidgetUpdate ret=%d", r);
 
-    // Hook CWidgetRadar::Update - pendekatan alternatif
-    {
-        void* t = (void*)(base + OFF_WidgetUpdate + 1);
-        int r = dHook(t, (void*)hk_WidgetUpdate, (void**)&orig_WidgetUpdate);
-        _logf("[radarilt] Hook WidgetUpdate ret=%d", r);
-    }
-
+    _logf("[radarilt] TILT=%.2f", TILT_FACTOR);
     _log("[radarilt] SELESAI");
-    if (aml) aml->ShowToast(false, "[RadarTilt] v1.7");
+    if (aml) aml->ShowToast(false, "[RadarTilt] v1.8");
 }
